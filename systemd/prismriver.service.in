@@ -1,0 +1,11 @@
+[Unit]
+Description=Prismriver WLED Audio Reactive server
+After=pipewire-pulse.service pulseaudio.service
+
+[Service]
+ExecStart=@BINDIR@/prismriver
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
