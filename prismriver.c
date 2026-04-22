@@ -193,8 +193,7 @@ static void wled_sync_feed(
 	const float band_agc_recovery_threshold = 3.0f;
 	const float band_agc_recovery_rate = 0.5f;
 
-	sync->state.current_peak_level = 0.1f;
-	sync->state.band_postgain = 1.0f / sync->state.target_peak_level;
+	sync->state.current_peak_level = 0.0f;
 
 	float bands[LOWRES_SPECTRUM_BANDS];
 
@@ -235,11 +234,19 @@ static void wled_sync_feed(
 
 		plerp(&sync->state.band_dyn_gain_smooth[i], sync->state.band_dyn_gain[i], 0.01f);
 
-		acc *= sync->state.band_postgain;
 		acc *= 255.0f;
 		bands[i] = acc;
 
 		spectrum += window_size;
+	}
+
+	plerp(&sync->state.target_peak_level, sync->state.current_peak_level, band_agc_response);
+	if(sync->state.target_peak_level > 0) {
+		sync->state.band_postgain = 1.0f / sync->state.target_peak_level;
+	}
+
+	for(size_t i = 0; i < LOWRES_SPECTRUM_BANDS; ++i) {
+		bands[i] *= sync->state.band_postgain;
 	}
 
 	for(int i = 0; i < LOWRES_SPECTRUM_BANDS; ++i) {
@@ -249,7 +256,6 @@ static void wled_sync_feed(
 		packet->fftResult[i] = (uint8_t)s;
 	}
 
-	plerp(&sync->state.target_peak_level, sync->state.current_peak_level, band_agc_response);
 }
 
 static void wled_sync_visualize(const WLEDSync *sync) {
