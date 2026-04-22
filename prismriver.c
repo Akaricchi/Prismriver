@@ -184,8 +184,8 @@ static void wled_sync_feed(
 		//
 		// let it run for a few minutes until the numbers below the graph
 		// bars stabilize. those are your multipliers.
-		0.058, 0.138, 0.180, 0.218, 0.244, 0.267, 0.297, 0.315,
-		0.335, 0.358, 0.371, 0.389, 0.415, 0.596, 1.849, 19.61,
+		0.058, 0.138, 0.182, 0.215, 0.244, 0.269, 0.293, 0.316,
+		0.335, 0.354, 0.373, 0.390, 0.422, 0.596, 1.856, 22.29,
 	};
 
 	const float band_agc_target = 0.5f;
@@ -232,7 +232,7 @@ static void wled_sync_feed(
 			plerp(&sync->state.band_dyn_gain[i], gain, band_agc_recovery_rate);
 		}
 
-		plerp(&sync->state.band_dyn_gain_smooth[i], sync->state.band_dyn_gain[i], 0.01f);
+		plerp(&sync->state.band_dyn_gain_smooth[i], sync->state.band_dyn_gain[i], 0.001f);
 
 		acc *= 255.0f;
 		bands[i] = acc;
