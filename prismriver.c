@@ -247,15 +247,11 @@ static void wled_sync_feed(
 
 	for(size_t i = 0; i < LOWRES_SPECTRUM_BANDS; ++i) {
 		bands[i] *= sync->state.band_postgain;
-	}
-
-	for(int i = 0; i < LOWRES_SPECTRUM_BANDS; ++i) {
 		plerp(&sync->state.smoothbands[i], bands[i], 0.9f);
 		float s = sync->state.smoothbands[i];
 		s = s >= 255 ? 255 : ceilf(s);
 		packet->fftResult[i] = (uint8_t)s;
 	}
-
 }
 
 static void wled_sync_visualize(const WLEDSync *sync) {
