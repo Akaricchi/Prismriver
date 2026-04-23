@@ -30,6 +30,7 @@
 #define SAMPLE_RATE 22050
 #define LOWRES_SPECTRUM_BANDS 16
 #define IDLE_FRAMES 10
+#define FPS ((float)SAMPLE_RATE / HOP_SIZE)
 
 #define WLED_PACKET_HEADER "00002"
 
@@ -43,11 +44,13 @@ static struct {
 	struct sockaddr_in6 *dest_addrs;
 	size_t num_dest_addrs;
 	int ttl;
+	float rms_peak_threshold;
 	bool visualize;
 	char source[128];
 } config = {
 	.ttl = 2,
 	.source = DEFAULT_SOURCE,
+	.rms_peak_threshold = 1.1f,
 };
 
 typedef struct AudioAnalysisData {
@@ -82,6 +85,9 @@ typedef struct WLEDSync {
 		float smoothed_vol;
 		float loudness_peak;
 		float agc_gain;
+		float rms_slow;
+		float rms_fast;
+		float rms_ratio;
 		float current_peak_level;
 		float target_peak_level;
 		float band_postgain;
@@ -122,6 +128,10 @@ static void plerp(float *a, float b, float f) {
 	*a = lerp(*a, b, f);
 }
 
+static float ms_to_lerp_factor(float ms) {
+	return 1.0f - expf(-1.0f / (ms / 1000.0f * FPS));
+}
+
 static void wled_sync_feed(
 	WLEDSync *sync,
 	float spectrum[QUANT_SIZE / 2],
@@ -145,6 +155,11 @@ static void wled_sync_feed(
 	}
 
 	float rms = sqrtf(sum_sq / QUANT_SIZE);
+	plerp(&sync->state.rms_fast, rms, ms_to_lerp_factor(23.0f));
+	plerp(&sync->state.rms_slow, rms, ms_to_lerp_factor(800.0f));
+
+	sync->state.rms_ratio = sync->state.rms_fast / (sync->state.rms_slow + 0.0001f);
+	packet->samplePeak = sync->state.rms_ratio > config.rms_peak_threshold;
 
 	const float target_rms = 0.5f;
 	const float agc_response = 0.05f;
@@ -155,15 +170,6 @@ static void wled_sync_feed(
 	}
 
 	float adj_volume = rms * sync->state.agc_gain;
-
-	if(adj_volume > sync->state.loudness_peak) {
-		sync->state.loudness_peak = adj_volume;
-		packet->samplePeak = 1;
-	} else {
-		sync->state.loudness_peak = lerp(sync->state.loudness_peak, peak_volume, 0.05f);
-		packet->samplePeak = 0;
-	}
-
 	sync->state.smoothed_vol = lerp(sync->state.smoothed_vol, adj_volume, 0.05f);
 
 	packet->sampleRaw = 255.0f * adj_volume;
@@ -254,6 +260,50 @@ static void wled_sync_feed(
 	}
 }
 
+static void print_hbar(
+	const char *label, int label_width, int width, float val, float max
+) {
+	int filled = (int)(val / max * (float)width);
+
+	if(filled > width) {
+		filled = width;
+	}
+
+	printf("%-*s [", label_width, label);
+
+	for(int i = 0; i < width; ++i) {
+		putchar(i < filled ? '#' : ' ');
+	}
+
+	printf("] %6.4f\n", val);
+}
+
+static void print_ratio_bar(
+	const char *label, int label_width, int width,
+	float ratio, float max, float threshold
+) {
+	int filled = (int)(ratio / max * (float)width);
+
+	if(filled > width) {
+		filled = width;
+	}
+
+	int tpos = (int)(threshold / max * (float)width);
+	printf("%-*s [", label_width, label);
+
+	for(int i = 0; i < width; ++i) {
+		if(i == tpos) {
+			putchar('|');
+		} else if(i < filled) {
+			putchar('#');
+		} else {
+			putchar(' ');
+		}
+	}
+
+	printf("] %6.4f\n", ratio);
+}
+
 static void wled_sync_visualize(const WLEDSync *sync) {
 	const WLEDSyncPacket *packet = &sync->packet;
 
@@ -271,7 +321,16 @@ static void wled_sync_visualize(const WLEDSync *sync) {
 		packet->sampleRaw,
 		packet->sampleSmth,
 		sync->state.agc_gain,
-		packet->samplePeak ? "(SAMPLE PEAK)" : "");
+		packet->samplePeak ? "(SAMPLE PEAK)" : ""
+	);
+
+	const int label_width = 8;
+	const int bar_width = 77;
+
+	print_hbar("RMS-FAST", label_width, bar_width, sync->state.rms_fast, 1.0f);
+	print_hbar("RMS-SLOW", label_width, bar_width, sync->state.rms_slow, 1.0f);
+	print_ratio_bar("RATIO",  label_width, bar_width, sync->state.rms_ratio,
+		2.0f, config.rms_peak_threshold);
 
 	for(int i = 255; i >= 0; i -= 16) {
 		for(int j = 0; j < 16; ++j) {
