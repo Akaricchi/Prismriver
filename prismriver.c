@@ -103,8 +103,9 @@ static inline void log_error(const char *fmt, ...) {
 	va_list va;
 	va_start(va, fmt);
 	vfprintf(stderr, fmt, va);
-	fputc('\n', stderr);
 	va_end(va);
+	fputc('\n', stderr);
+	fflush(stderr);
 }
 
 [[gnu::format(printf, 1, 2)]]
@@ -112,8 +113,9 @@ static inline void log_info(const char *fmt, ...) {
 	va_list va;
 	va_start(va, fmt);
 	vfprintf(stdout, fmt, va);
-	fputc('\n', stdout);
 	va_end(va);
+	fputc('\n', stdout);
+	fflush(stdout);
 }
 
 static float hann(int i, int len) {
@@ -260,6 +262,13 @@ static void wled_sync_feed(
 	}
 }
 
+static void wled_sync_clear(WLEDSync *sync) {
+	sync->packet = (WLEDSyncPacket) {
+		.header = WLED_PACKET_HEADER,
+		.frameCounter = sync->packet.frameCounter + 1,
+	};
+}
+
 #define ANSI_CLEAR   "\033[2J\033[H"
 #define ANSI_RESET   "\033[0m"
 #define ANSI_DIM     "\033[2m"
@@ -365,7 +374,7 @@ static void wled_sync_visualize(const WLEDSync *sync) {
 		ANSI_CLEAR
 		"FFT peak       % 10.2f @ % 10.2f Hz\n"
 		"FFT post-gain: % 10f  % 10f T-PEAK  % 10f C-PEAK\n"
-		"Gain:          % 10f   %s\n\n",
+		"Gain:          % 10f   Frame: % 5i   %s\n\n",
 
 		packet->FFT_Magnitude,
 		packet->FFT_MajorPeak,
@@ -373,6 +382,7 @@ static void wled_sync_visualize(const WLEDSync *sync) {
 		sync->state.target_peak_level,
 		sync->state.current_peak_level,
 		sync->state.agc_gain,
+		packet->frameCounter,
 		packet->samplePeak ? ANSI_BRED "(SAMPLE PEAK)" ANSI_RESET : ""
 	);
 
@@ -465,6 +475,7 @@ static bool wled_sync_init(WLEDSync *sync) {
 
 	sync->state.target_peak_level = 1.0f;
 	sync->state.agc_gain = 1.0f;
+	sync->state.idle_timeout = 1;
 
 	if((sync->sockfd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
 		log_error("socket() failed: %s", strerror(errno));
@@ -565,6 +576,14 @@ static void wled_sync_send(WLEDSync *sync) {
 	for(size_t i = 0; i < config.num_dest_addrs; ++i) {
 		wled_sync_send_to(sync, config.dest_addrs + i);
 	}
+}
+
+static void wled_sync_commit(WLEDSync *sync) {
+	if(config.visualize) {
+		wled_sync_visualize(sync);
+	}
+
+	wled_sync_send(sync);
 }
 
 enum {
@@ -807,30 +826,30 @@ int main(int argc, char **argv) {
 
 		if(silent) {
 			if(wled_sync.state.idle_timeout > 0) {
-				wled_sync.state.idle_timeout--;
+				if(--wled_sync.state.idle_timeout == 0) {
+					log_info("Source is silent; sending empty packet and suspending");
+					wled_sync_clear(&wled_sync);
+					wled_sync_commit(&wled_sync);
+					continue;
+				}
 			} else {
 				continue;
 			}
 		} else {
+			if(wled_sync.state.idle_timeout == 0) {
+				log_info("Source is playing; resuming");
+			}
+
 			wled_sync.state.idle_timeout = IDLE_FRAMES;
 		}
 
 		wled_sync_feed(&wled_sync, G.audio.spectrum, G.audio.window);
-
-		if(config.visualize) {
-			wled_sync_visualize(&wled_sync);
-		}
-
-		wled_sync_send(&wled_sync);
+		wled_sync_commit(&wled_sync);
 	}
 
-	log_info("Interrupted, sending cleanup packet and exiting");
+	log_info("Interrupted; sending cleanup packet and exiting");
 
-	wled_sync.packet = (WLEDSyncPacket) {
-		.header = WLED_PACKET_HEADER,
-		.frameCounter = wled_sync.packet.frameCounter + 1,
-	};
-
+	wled_sync_clear(&wled_sync);
 	wled_sync_send(&wled_sync);
 	return 0;
 }
