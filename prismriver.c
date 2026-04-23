@@ -260,96 +260,159 @@ static void wled_sync_feed(
 	}
 }
 
+#define ANSI_CLEAR   "\033[2J\033[H"
+#define ANSI_RESET   "\033[0m"
+#define ANSI_DIM     "\033[2m"
+#define ANSI_BRED    "\033[91m"
+#define ANSI_BGREEN  "\033[92m"
+#define ANSI_BYELLOW "\033[93m"
+#define ANSI_BCYAN   "\033[96m"
+#define ANSI_BWHITE  "\033[97m"
+
+static const char *const SUBBLOCKS[] = {
+	" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"
+};
+
+static const char *bar_color(float frac) {
+	if(frac >= 0.85f) { return ANSI_BRED; }
+	if(frac >= 0.6f)  { return ANSI_BYELLOW; }
+	return ANSI_BGREEN;
+}
+
+static const char *spectrum_row_color(int i) {
+	if(i > 192) { return ANSI_BRED; }
+	if(i > 128) { return ANSI_BYELLOW; }
+	if(i > 64)  { return ANSI_BGREEN; }
+	return ANSI_BCYAN;
+}
+
 static void print_hbar(
 	const char *label, int label_width, int width, float val, float max
 ) {
-	int filled = (int)(val / max * (float)width);
+	float frac = val / max;
 
-	if(filled > width) {
-		filled = width;
+	if(frac > 1.0f) {
+		frac = 1.0f;
 	}
 
-	printf("%-*s [", label_width, label);
+	float cells = frac * (float)width;
+	int full = (int)cells;
+	int sub = (int)((cells - (float)full) * 8.0f);
+
+	printf(ANSI_DIM "%-*s" ANSI_RESET " [%s", label_width, label, bar_color(frac));
 
 	for(int i = 0; i < width; ++i) {
-		putchar(i < filled ? '#' : ' ');
+		if(i < full) {
+			fputs("█", stdout);
+		} else if(i == full) {
+			fputs(SUBBLOCKS[sub], stdout);
+		} else {
+			fputc(' ', stdout);
+		}
 	}
 
-	printf("] %6.4f\n", val);
+	if(val > max) {
+		printf(ANSI_RESET "] " ANSI_BRED  "%6.4f" ANSI_RESET "\n", val);
+	} else {
+		printf(ANSI_RESET "] " ANSI_BCYAN "%6.4f" ANSI_RESET "\n", val);
+	}
 }
 
 static void print_ratio_bar(
 	const char *label, int label_width, int width,
 	float ratio, float max, float threshold
 ) {
-	int filled = (int)(ratio / max * (float)width);
+	float frac = ratio / max;
 
-	if(filled > width) {
-		filled = width;
+	if(frac > 1.0f) {
+		frac = 1.0f;
 	}
 
+	float cells = frac * (float)width;
+	int full = (int)cells;
+	int sub = (int)((cells - (float)full) * 8.0f);
 	int tpos = (int)(threshold / max * (float)width);
-	printf("%-*s [", label_width, label);
+
+	bool peaked = ratio > threshold;
+	const char *color = peaked ? ANSI_BRED : ANSI_BCYAN;
+
+	printf(ANSI_DIM "%-*s" ANSI_RESET " [%s", label_width, label, color);
 
 	for(int i = 0; i < width; ++i) {
 		if(i == tpos) {
-			putchar('|');
-		} else if(i < filled) {
-			putchar('#');
+			fputs(ANSI_BWHITE "│", stdout);
+			fputs(color, stdout);
+		} else if(i < full) {
+			fputs("█", stdout);
+		} else if(i == full) {
+			fputs(SUBBLOCKS[sub], stdout);
 		} else {
-			putchar(' ');
+			fputc(' ', stdout);
 		}
 	}
 
-	printf("] %6.4f\n", ratio);
+	if(peaked) {
+		printf(ANSI_RESET "] " ANSI_BRED  "%6.4f" ANSI_RESET "\n", ratio);
+	} else {
+		printf(ANSI_RESET "] " ANSI_BCYAN "%6.4f" ANSI_RESET "\n", ratio);
+	}
 }
 
 static void wled_sync_visualize(const WLEDSync *sync) {
 	const WLEDSyncPacket *packet = &sync->packet;
 
 	printf(
-		"\033[2J\033[H"
-		"FFT peak       % 16f @ % 13f Hz   \n"
-		"FFT post-gain: %16f  % 16f T-PEAK  % 16f C-PEAK\n"
-		"% 16f RAW  % 16f SMTH  % 16f GAIN   %s\n",
+		ANSI_CLEAR
+		"FFT peak       % 10.2f @ % 10.2f Hz\n"
+		"FFT post-gain: % 10f  % 10f T-PEAK  % 10f C-PEAK\n"
+		"Gain:          % 10f   %s\n\n",
 
 		packet->FFT_Magnitude,
 		packet->FFT_MajorPeak,
 		sync->state.band_postgain,
 		sync->state.target_peak_level,
 		sync->state.current_peak_level,
-		packet->sampleRaw,
-		packet->sampleSmth,
 		sync->state.agc_gain,
-		packet->samplePeak ? "(SAMPLE PEAK)" : ""
+		packet->samplePeak ? ANSI_BRED "(SAMPLE PEAK)" ANSI_RESET : ""
 	);
 
 	const int label_width = 8;
-	const int bar_width = 77;
+	const int bar_width   = 77;
 
+	print_hbar("RAW", label_width, bar_width, packet->sampleRaw / 255.0f, 1.0f);
+	print_hbar("SMOOTH", label_width, bar_width, packet->sampleSmth / 255.0f, 1.0f);
 	print_hbar("RMS-FAST", label_width, bar_width, sync->state.rms_fast, 1.0f);
 	print_hbar("RMS-SLOW", label_width, bar_width, sync->state.rms_slow, 1.0f);
-	print_ratio_bar("RATIO",  label_width, bar_width, sync->state.rms_ratio,
+	print_ratio_bar("RATIO", label_width, bar_width, sync->state.rms_ratio,
 		2.0f, config.rms_peak_threshold);
 
+	fputc('\n', stdout);
+
 	for(int i = 255; i >= 0; i -= 16) {
+		const char *col = spectrum_row_color(i);
+
 		for(int j = 0; j < 16; ++j) {
 			if(packet->fftResult[j] < i) {
-				printf(". . . ");
+				fputs(ANSI_DIM "░░░░░ " ANSI_RESET, stdout);
 			} else {
-				printf("##### ");
+				printf("%s█████ " ANSI_RESET, col);
 			}
 		}
-		putc('\n', stdout);
+
+		fputc('\n', stdout);
 	}
+
+	fputs(ANSI_DIM, stdout);
+
 	for(int j = 0; j < 16; ++j) {
 		float g = sync->state.band_dyn_gain_smooth[j];
-		if(g < 10)        printf("%5.3f ", g);
-		else if(g < 100)  printf("%5.2f ", g);
-		else if(g < 1000) printf("%5.1f ", g);
-		else              printf("% 5i ", (int)g);
+		if(g < 10)        { printf("%5.3f ", g); }
+		else if(g < 100)  { printf("%5.2f ", g); }
+		else if(g < 1000) { printf("%5.1f ", g); }
+		else              { printf("% 5i ", (int)g); }
 	}
-	putc('\n', stdout);
+
+	fputs(ANSI_RESET "\n", stdout);
 	fflush(stdout);
 }
 
