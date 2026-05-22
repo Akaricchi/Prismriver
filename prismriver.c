@@ -8,11 +8,22 @@
 #include <errno.h>
 #include <fftw3.h>
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <netdb.h>
-#include <pulse/error.h>
-#include <pulse/sample.h>
-#include <pulse/simple.h>
+#include <pipewire/keys.h>
+#include <pipewire/log.h>
+#include <pipewire/main-loop.h>
+#include <pipewire/pipewire.h>
+#include <pipewire/properties.h>
+#include <pipewire/stream.h>
+#include <spa/param/audio/raw-utils.h>
+#include <spa/param/audio/raw.h>
+#include <spa/param/param.h>
+#include <spa/pod/builder.h>
+#include <spa/support/log.h>
+#include <spa/utils/defs.h>
+#include <spa/utils/ringbuffer.h>
 #include <stdalign.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -38,31 +49,18 @@
 #define WLED_DEFAULT_PORT    "11988"
 #define WLED_DEFAULT_DEST    WLED_DEFAULT_ADDRESS ":" WLED_DEFAULT_PORT
 
-#define DEFAULT_SOURCE "@DEFAULT_SOURCE@"
+#define DEFAULT_SOURCE "auto"
 
-static struct {
-	struct sockaddr_in6 *dest_addrs;
-	size_t num_dest_addrs;
-	int ttl;
-	float rms_peak_threshold;
-	bool visualize;
-	char source[128];
-} config = {
-	.ttl = 2,
-	.source = DEFAULT_SOURCE,
-	.rms_peak_threshold = 1.1f,
-};
-
-typedef struct AudioAnalysisData {
+typedef struct AudioAnalyzer {
 	float window[QUANT_SIZE];
 	float spectrum[QUANT_SIZE / 2];
 	float spectrum_lowres[LOWRES_SPECTRUM_BANDS];
-} AudioAnalysisData;
-
-static struct {
-	AudioAnalysisData audio;
-	bool stopped;
-} G;
+	float sliding_buffer[QUANT_SIZE];
+	float window_weights[QUANT_SIZE];
+	fftwf_complex fft[QUANT_SIZE / 2 + 1];
+	fftwf_plan fft_plan;
+	bool silent;
+} AudioAnalyzer;
 
 typedef struct [[gnu::packed]] WLEDSyncPacket {
 	char    header[6];              //  06 Bytes  offset 0 - "00002" for protocol version 2 ( includes \0 for c-style string termination)
@@ -97,6 +95,41 @@ typedef struct WLEDSync {
 		int idle_timeout;
 	} state;
 } WLEDSync;
+
+typedef struct Config {
+	struct sockaddr_in6 *dest_addrs;
+	size_t num_dest_addrs;
+	int ttl;
+	float rms_peak_threshold;
+	bool visualize;
+	bool passive;
+	char source[128];
+} Config;
+
+static Config DEFAULT_CONFIG = {
+	.ttl = 2,
+	.source = DEFAULT_SOURCE,
+	.rms_peak_threshold = 1.1f,
+	.passive = true,
+};
+
+typedef struct Prismriver {
+	WLEDSync wled_sync;
+	AudioAnalyzer analyzer;
+	Config config;
+
+	struct {
+		struct spa_ringbuffer ring;
+		float buf[QUANT_SIZE];
+	} input;
+
+	struct {
+		struct pw_main_loop *main_loop;
+		struct pw_stream *stream;
+	} pw;
+
+	int exit_code;
+} Prismriver;
 
 [[gnu::format(printf, 1, 2)]]
 static inline void log_error(const char *fmt, ...) {
@@ -135,7 +168,7 @@ static float ms_to_lerp_factor(float ms) {
 }
 
 static void wled_sync_feed(
-	WLEDSync *sync,
+	WLEDSync *sync, const Config *config,
 	float spectrum[QUANT_SIZE / 2],
 	float samples[QUANT_SIZE]
 ) {
@@ -161,7 +194,7 @@ static void wled_sync_feed(
 	plerp(&sync->state.rms_slow, rms, ms_to_lerp_factor(800.0f));
 
 	sync->state.rms_ratio = sync->state.rms_fast / (sync->state.rms_slow + 0.0001f);
-	packet->samplePeak = sync->state.rms_ratio > config.rms_peak_threshold;
+	packet->samplePeak = sync->state.rms_ratio > config->rms_peak_threshold;
 
 	const float target_rms = 0.5f;
 	const float agc_response = 0.05f;
@@ -367,7 +400,7 @@ static void print_ratio_bar(
 	}
 }
 
-static void wled_sync_visualize(const WLEDSync *sync) {
+static void wled_sync_visualize(const WLEDSync *sync, const Config *config) {
 	const WLEDSyncPacket *packet = &sync->packet;
 
 	printf(
@@ -394,7 +427,7 @@ static void wled_sync_visualize(const WLEDSync *sync) {
 	print_hbar("RMS-FAST", label_width, bar_width, sync->state.rms_fast, 1.0f);
 	print_hbar("RMS-SLOW", label_width, bar_width, sync->state.rms_slow, 1.0f);
 	print_ratio_bar("RATIO", label_width, bar_width, sync->state.rms_ratio,
-		2.0f, config.rms_peak_threshold);
+		2.0f, config->rms_peak_threshold);
 
 	fputc('\n', stdout);
 
@@ -468,7 +501,7 @@ static bool _set_socket_opt_int(
 #define set_socket_opt_int(fd, level, optname, optval) \
 	_set_socket_opt_int(fd, level, optname, optval, #optname, #optval)
 
-static bool wled_sync_init(WLEDSync *sync) {
+static bool wled_sync_init(WLEDSync *sync, const Config *config) {
 	sync->packet = (WLEDSyncPacket) {
 		.header = WLED_PACKET_HEADER,
 	};
@@ -482,13 +515,13 @@ static bool wled_sync_init(WLEDSync *sync) {
 		return false;
 	}
 
-	set_socket_opt_int(sync->sockfd, IPPROTO_IP, IP_MULTICAST_TTL, config.ttl);
-	set_socket_opt_int(sync->sockfd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, config.ttl);
+	set_socket_opt_int(sync->sockfd, IPPROTO_IP, IP_MULTICAST_TTL, config->ttl);
+	set_socket_opt_int(sync->sockfd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, config->ttl);
 	set_socket_opt_int(sync->sockfd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
 	set_socket_opt_int(sync->sockfd, SOL_SOCKET, SO_BROADCAST, 1);
 
-	for(size_t i = 0; i < config.num_dest_addrs; ++i) {
-		struct sockaddr_in6 *addr = config.dest_addrs + i;
+	for(size_t i = 0; i < config->num_dest_addrs; ++i) {
+		struct sockaddr_in6 *addr = config->dest_addrs + i;
 
 		char host[NI_MAXHOST];
 		char serv[NI_MAXSERV];
@@ -509,7 +542,7 @@ static bool wled_sync_init(WLEDSync *sync) {
 	return true;
 }
 
-static bool add_dest_addr(char *addr_str) {
+static bool config_add_dest_addr(Config *config, char *addr_str) {
 	char *node, *service;
 	if(!parse_node_service(addr_str, &node, &service)) {
 		log_error("Malformed address: %s", addr_str);
@@ -533,17 +566,17 @@ static bool add_dest_addr(char *addr_str) {
 		return false;
 	}
 
-	assert(addr->ai_addrlen == sizeof(*config.dest_addrs));
-	config.dest_addrs = realloc(config.dest_addrs, sizeof(*config.dest_addrs) * (config.num_dest_addrs + 1));
-	assert(config.dest_addrs != NULL);
-	memcpy(config.dest_addrs + config.num_dest_addrs, addr->ai_addr, sizeof(*config.dest_addrs));
+	assert(addr->ai_addrlen == sizeof(*config->dest_addrs));
+	config->dest_addrs = realloc(config->dest_addrs, sizeof(*config->dest_addrs) * (config->num_dest_addrs + 1));
+	assert(config->dest_addrs != NULL);
+	memcpy(config->dest_addrs + config->num_dest_addrs, addr->ai_addr, sizeof(*config->dest_addrs));
 	freeaddrinfo(addr);
-	config.num_dest_addrs++;
+	config->num_dest_addrs++;
 
 	return true;
 }
 
-static void wled_sync_send_to(WLEDSync *sync, struct sockaddr_in6 *addr) {
+static void wled_sync_send_to(const WLEDSync *sync, const struct sockaddr_in6 *addr) {
 	ssize_t sent = sendto(
 		sync->sockfd,
 		&sync->packet, sizeof(sync->packet),
@@ -572,18 +605,53 @@ static void wled_sync_send_to(WLEDSync *sync, struct sockaddr_in6 *addr) {
 	}
 }
 
-static void wled_sync_send(WLEDSync *sync) {
-	for(size_t i = 0; i < config.num_dest_addrs; ++i) {
-		wled_sync_send_to(sync, config.dest_addrs + i);
+static void wled_sync_send(const WLEDSync *sync, const Config *config) {
+	for(size_t i = 0; i < config->num_dest_addrs; ++i) {
+		wled_sync_send_to(sync, config->dest_addrs + i);
 	}
 }
 
-static void wled_sync_commit(WLEDSync *sync) {
-	if(config.visualize) {
-		wled_sync_visualize(sync);
+static void wled_sync_commit(const WLEDSync *sync, const Config *config) {
+	if(config->visualize) {
+		wled_sync_visualize(sync, config);
 	}
 
-	wled_sync_send(sync);
+	wled_sync_send(sync, config);
+}
+
+static void analyzer_init(AudioAnalyzer *analyzer) {
+	*analyzer = (AudioAnalyzer) { };
+
+	for(int i = 0; i < QUANT_SIZE; ++i) {
+		analyzer->window_weights[i] = hann(i, QUANT_SIZE);
+	}
+
+	analyzer->fft_plan = fftwf_plan_dft_r2c_1d(QUANT_SIZE, analyzer->window, analyzer->fft, FFTW_MEASURE);
+}
+
+static void analyzer_update(AudioAnalyzer *analyzer) {
+	bool silent = true;
+
+	for(int i = 0; i < QUANT_SIZE; ++i) {
+		analyzer->window[i] = analyzer->sliding_buffer[i] * analyzer->window_weights[i];
+		silent = silent && (fabsf(analyzer->window[i]) == 0.0f);
+	}
+
+	auto fft = analyzer->fft;
+
+	if(silent) {
+		if(!analyzer->silent) {
+			memset(analyzer->spectrum, 0, sizeof(analyzer->spectrum));
+			analyzer->silent = true;
+		}
+	} else {
+		analyzer->silent = false;
+		fftwf_execute(analyzer->fft_plan);
+
+		for(int i = 0; i < QUANT_SIZE / 2; ++i) {
+			analyzer->spectrum[i] = sqrtf(fft[i][0] * fft[i][0] + fft[i][1] * fft[i][1]);
+		}
+	}
 }
 
 enum {
@@ -592,6 +660,8 @@ enum {
 	OPT_VISUALIZE = 'v',
 	OPT_SOURCE = 's',
 	OPT_TTL = INT_MIN,
+	OPT_PASSIVE,
+	OPT_ACTIVE,
 };
 
 typedef struct CLIOption {
@@ -600,9 +670,13 @@ typedef struct CLIOption {
 	const char *help;
 } CLIOption;
 
-static CLIOption cli_opts[] = {
+static const CLIOption cli_opts[] = {
 	{ { "source", required_argument, 0, OPT_SOURCE, },
-		"src", "PulseAudio source name; default is " DEFAULT_SOURCE, },
+		"src", "PipeWire source name, append .monitor to capture a sink monitor; default is " DEFAULT_SOURCE, },
+	{ { "active", no_argument, 0, OPT_ACTIVE, },
+		NULL, "make the PipeWire node always active, useful when capturing a source", },
+	{ { "passive", no_argument, 0, OPT_PASSIVE, },
+		NULL, "make the PipeWire node passive (default)", },
 	{ { "address", required_argument, 0, OPT_ADDRESS, },
 		"hostname[:port]", "where to send the data, can specify multiple times; default is " WLED_DEFAULT_ADDRESS ":" WLED_DEFAULT_PORT },
 	{ { "ttl", required_argument, 0, OPT_TTL, },
@@ -620,7 +694,7 @@ static void print_help(char *progname) {
 	const int nopts = sizeof(cli_opts) / sizeof(cli_opts[0]);
 
 	for(int i = 0; i < nopts; ++i) {
-		CLIOption *opt = cli_opts + i;
+		const CLIOption *opt = cli_opts + i;
 
 		if(opt->opt.val > 0) {
 			printf("  -%c, --%s ", opt->opt.val, opt->opt.name);
@@ -651,7 +725,7 @@ static void print_help(char *progname) {
 	}
 }
 
-static int parse_cli(int argc, char **argv) {
+static int config_parse_cli(Config *config, int argc, char **argv) {
 	const int nopts = sizeof(cli_opts) / sizeof(*cli_opts);
 	struct option opts[nopts + 1];
 	char optc[2*nopts+1];
@@ -691,11 +765,11 @@ static int parse_cli(int argc, char **argv) {
 			}
 
 			case OPT_TTL: {
-				config.ttl = strtol(optarg, &endptr, 10);
+				config->ttl = strtol(optarg, &endptr, 10);
 				if(
 					endptr != optarg + strlen(optarg) ||
-					config.ttl < 0 ||
-					config.ttl > 255
+					config->ttl < 0 ||
+					config->ttl > 255
 				) {
 				   log_error("TTL must be a number between 0 and 255");
 				   return 1;
@@ -705,151 +779,277 @@ static int parse_cli(int argc, char **argv) {
 			}
 
 			case OPT_ADDRESS: {
-				add_dest_addr(optarg);
+				config_add_dest_addr(config, optarg);
 				break;
 			}
 
 			case OPT_VISUALIZE:
-				config.visualize = true;
+				config->visualize = true;
 				break;
 
 			case OPT_SOURCE: {
 				size_t src_len = strlen(optarg);
 
-				if(src_len >= sizeof(config.source)) {
+				if(src_len >= sizeof(config->source)) {
 					log_error("Source name is too long");
 					return 1;
 				}
 
-				memcpy(config.source, optarg, src_len + 1);
+				memcpy(config->source, optarg, src_len + 1);
+				break;
+			}
+
+			case OPT_ACTIVE: {
+				config->passive = false;
+				break;
+			}
+
+			case OPT_PASSIVE: {
+				config->passive = true;
 				break;
 			}
 		}
 	}
 
-	if(config.num_dest_addrs == 0) {
+	if(config->num_dest_addrs == 0) {
 		char buf[sizeof(WLED_DEFAULT_DEST) + 1] = {};
 		memcpy(buf, WLED_DEFAULT_DEST, sizeof(WLED_DEFAULT_DEST));
-		add_dest_addr(buf);
+		config_add_dest_addr(config, buf);
 	}
 
 	return -1;
 }
 
-static void handle_signal(int) {
-	G.stopped = true;
+static void on_signal(void *userdata, int) {
+	Prismriver *pr = userdata;
+	pw_main_loop_quit(pr->pw.main_loop);
 }
 
-int main(int argc, char **argv) {
-	int exitcode = parse_cli(argc, argv);
+static void on_state_changed(
+	void *data, enum pw_stream_state old_st, enum pw_stream_state new_st, const char *error
+) {
+	Prismriver *pr = data;
 
-	if(exitcode >= 0) {
-		return exitcode;
-	}
+	switch(new_st) {
+		case PW_STREAM_STATE_ERROR:
+			log_error("PipeWire stream error: %s", error);
+			pr->exit_code = 1;
+			pw_main_loop_quit(pr->pw.main_loop);
+			break;
 
-	WLEDSync wled_sync = {};
+		case PW_STREAM_STATE_PAUSED:
+			log_info("PipeWire stream is paused");
+			wled_sync_clear(&pr->wled_sync);
+			wled_sync_commit(&pr->wled_sync, &pr->config);
+			break;
 
-	if(!wled_sync_init(&wled_sync)) {
-		return 1;
-	}
-
-	pa_sample_spec ss = {
-		.channels = 1,
-		.format = PA_SAMPLE_FLOAT32NE,
-		.rate = SAMPLE_RATE,
-	};
-
-	pa_buffer_attr ba = {
-		.maxlength = SAMPLE_SIZE * QUANT_SIZE,
-		.fragsize = SAMPLE_SIZE * HOP_SIZE,
-	};
-
-	int err = 0;
-
-	pa_simple *pa = pa_simple_new(
-		NULL,
-		"Prismriver",
-		PA_STREAM_RECORD,
-		config.source,
-		"WLED Audio Reactive server",
-		&ss,
-		NULL,
-		&ba,
-		&err
-	);
-
-	if(pa == NULL) {
-		fprintf(stderr, "pa_simple_new() returned error: %s\n", pa_strerror(err));
-		abort();
-	}
-
-	assert(pa != NULL);
-
-	float sliding_buffer[QUANT_SIZE] = {};
-	fftwf_complex fft[QUANT_SIZE/2 + 1];
-	fftwf_plan fft_plan = fftwf_plan_dft_r2c_1d(QUANT_SIZE, G.audio.window, fft, FFTW_MEASURE);
-
-	float window_weights[QUANT_SIZE];
-	for(int i = 0; i < QUANT_SIZE; ++i) {
-		window_weights[i] = hann(i, QUANT_SIZE);
-	}
-
-	struct sigaction sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = handle_signal;
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
-
-	for(;!G.stopped;) {
-		memmove(sliding_buffer, sliding_buffer + HOP_SIZE, HOP_SIZE * SAMPLE_SIZE);
-
-		if(pa_simple_read(pa, sliding_buffer + (QUANT_SIZE - HOP_SIZE), HOP_SIZE * SAMPLE_SIZE, &err)) {
-			log_error("pa_simple_read() error: %s", pa_strerror(err));
-		}
-
-		bool silent = true;
-
-		for(int i = 0; i < QUANT_SIZE; ++i) {
-			G.audio.window[i] = sliding_buffer[i] * window_weights[i];
-			silent = silent && (fabsf(G.audio.window[i]) == 0.0f);
-		}
-
-		if(silent) {
-			memset(G.audio.spectrum, 0, sizeof(G.audio.spectrum));
-		} else {
-			fftwf_execute(fft_plan);
-
-			for(int i = 0; i < QUANT_SIZE / 2; ++i) {
-				G.audio.spectrum[i] = sqrtf(fft[i][0] * fft[i][0] + fft[i][1] * fft[i][1]);
+		case PW_STREAM_STATE_STREAMING:
+			if(old_st == PW_STREAM_STATE_PAUSED) {
+				log_info("PipeWire stream is resuming");
 			}
-		}
+			break;
 
-		if(silent) {
-			if(wled_sync.state.idle_timeout > 0) {
-				if(--wled_sync.state.idle_timeout == 0) {
-					log_info("Source is silent; sending empty packet and suspending");
-					wled_sync_clear(&wled_sync);
-					wled_sync_commit(&wled_sync);
-					continue;
-				}
-			} else {
-				continue;
+		default:
+			break;
+	}
+}
+
+static void on_process(void *data) {
+	Prismriver *pr = data;
+	struct pw_buffer *pw_buf;
+	struct spa_buffer *spa_buf;
+
+	pw_buf = pw_stream_dequeue_buffer(pr->pw.stream);
+	if(pw_buf == NULL) {
+		log_error("pw_stream_dequeue_buffer() failed");
+		return;
+	}
+
+	spa_buf = pw_buf->buffer;
+	float *samples = spa_buf->datas[0].data;
+
+	if(samples == NULL) {
+		pw_stream_queue_buffer(pr->pw.stream, pw_buf);
+		return;
+	}
+
+	uint32_t samples_size = spa_buf->datas[0].chunk->size;
+	uint32_t buf_size = sizeof(pr->input.buf);
+	uint32_t write_idx;
+
+	int32_t fill = spa_ringbuffer_get_write_index(&pr->input.ring, &write_idx);
+
+	if(fill < 0 || buf_size - (uint32_t)fill < samples_size) {
+		log_error("Ring buffer xrun! Frame dropped. Fill level: %d; frame size: %u", fill, samples_size);
+		pw_stream_queue_buffer(pr->pw.stream, pw_buf);
+		return;
+	}
+
+	spa_ringbuffer_write_data(&pr->input.ring, pr->input.buf, buf_size, write_idx % buf_size, samples, samples_size);
+	spa_ringbuffer_write_update(&pr->input.ring, write_idx + samples_size);
+
+	pw_stream_queue_buffer(pr->pw.stream, pw_buf);
+
+	uint32_t read_idx;
+	int32_t avail;
+	uint32_t hop_buf_size = HOP_SIZE * SAMPLE_SIZE;
+
+	while((avail = spa_ringbuffer_get_read_index(&pr->input.ring, &read_idx)) >= (int32_t)hop_buf_size) {
+		WLEDSync *wled_sync = &pr->wled_sync;
+		AudioAnalyzer *analyzer = &pr->analyzer;
+		Config *config = &pr->config;
+
+		memmove(analyzer->sliding_buffer, analyzer->sliding_buffer + HOP_SIZE, hop_buf_size);
+		float *tail = analyzer->sliding_buffer + (QUANT_SIZE - HOP_SIZE);
+		spa_ringbuffer_read_data(&pr->input.ring, pr->input.buf, buf_size, read_idx % buf_size, tail, hop_buf_size);
+		spa_ringbuffer_read_update(&pr->input.ring, read_idx + hop_buf_size);
+
+		analyzer_update(analyzer);
+
+		if(analyzer->silent) {
+			if(wled_sync->state.idle_timeout > 0 && --wled_sync->state.idle_timeout == 0) {
+				log_info("Source is silent; sending empty packet and suspending");
+				wled_sync_clear(wled_sync);
+				wled_sync_commit(wled_sync, config);
 			}
 		} else {
-			if(wled_sync.state.idle_timeout == 0) {
+			if(wled_sync->state.idle_timeout == 0) {
 				log_info("Source is playing; resuming");
 			}
 
-			wled_sync.state.idle_timeout = IDLE_FRAMES;
+			wled_sync->state.idle_timeout = IDLE_FRAMES;
 		}
 
-		wled_sync_feed(&wled_sync, G.audio.spectrum, G.audio.window);
-		wled_sync_commit(&wled_sync);
+		if(wled_sync->state.idle_timeout > 0) {
+			wled_sync_feed(wled_sync, config, analyzer->spectrum, analyzer->window);
+			wled_sync_commit(wled_sync, config);
+		}
+	}
+}
+
+int main(int argc, char **argv) {
+	pw_init(&argc, &argv);
+	pw_log_set_level(SPA_LOG_LEVEL_TRACE);
+
+	Prismriver pr = {
+		.config = DEFAULT_CONFIG,
+	};
+
+	pr.exit_code = config_parse_cli(&pr.config, argc, argv);
+
+	if(pr.exit_code >= 0) {
+		return pr.exit_code;
 	}
 
-	log_info("Interrupted; sending cleanup packet and exiting");
+	if(!wled_sync_init(&pr.wled_sync, &pr.config)) {
+		return 1;
+	}
 
-	wled_sync_clear(&wled_sync);
-	wled_sync_send(&wled_sync);
-	return 0;
+	if(!(pr.pw.main_loop = pw_main_loop_new(NULL))) {
+		log_error("Failed to create PipeWire main loop\n");
+		return 1;
+	}
+
+	auto loop = pw_main_loop_get_loop(pr.pw.main_loop);
+
+	struct pw_properties *props = pw_properties_new(
+		PW_KEY_APP_NAME, "Prismriver",
+		PW_KEY_APP_ID, "io.github.akaricchi.Prismriver",
+
+		PW_KEY_MEDIA_TYPE, "Audio",
+		PW_KEY_MEDIA_CATEGORY, "Capture",
+		PW_KEY_MEDIA_ROLE, "DSP",
+
+		PW_KEY_NODE_NAME, "Prismriver",
+		PW_KEY_NODE_DESCRIPTION, "WLED Audio Reactive server",
+	NULL);
+	assert(props != NULL);
+	pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%u/%u", HOP_SIZE, SAMPLE_RATE);
+	pw_properties_setf(props, PW_KEY_NODE_MAX_LATENCY, "%u/%u", HOP_SIZE, SAMPLE_RATE);
+
+	if(!strcmp(pr.config.source, "auto")) {
+		pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
+	} else {
+		const char mon_suffix[] = ".monitor";
+		size_t src_len = strlen(pr.config.source);
+		size_t mon_suffix_len = sizeof(mon_suffix) - 1;
+		bool monitor = false;
+
+		if(src_len >= mon_suffix_len && !strcmp(pr.config.source + src_len - mon_suffix_len, mon_suffix)) {
+			pr.config.source[src_len - mon_suffix_len] = 0;
+			pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
+			monitor = true;
+		}
+
+		pw_properties_set(props, PW_KEY_TARGET_OBJECT, pr.config.source);
+
+		if(monitor) {
+			log_info("Capturing monitor of %s", pr.config.source);
+		} else {
+			log_info("Capturing %s", pr.config.source);
+		}
+	}
+
+	if(pr.config.passive) {
+		pw_properties_set(props, PW_KEY_NODE_PASSIVE, "true");
+	} else {
+		pw_properties_set(props, PW_KEY_NODE_ALWAYS_PROCESS, "true");
+	}
+
+	uint8_t pod_buffer[1024];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
+
+	const struct spa_pod *connect_params[1];
+	connect_params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
+		&SPA_AUDIO_INFO_RAW_INIT(
+			.format = SPA_AUDIO_FORMAT_F32,
+			.channels = 1,
+			.rate = SAMPLE_RATE,
+			.position[0] = SPA_AUDIO_CHANNEL_MONO,
+		)
+	);
+
+	pr.pw.stream = pw_stream_new_simple(
+		loop, "Prismriver", props,
+		&(struct pw_stream_events) {
+			PW_VERSION_STREAM_EVENTS,
+			.process = on_process,
+			.state_changed = on_state_changed,
+		},
+		&pr
+	);
+
+	if(pr.pw.stream == NULL) {
+		log_error("Failed to create PipeWire stream");
+		return 1;
+	}
+
+	int status = pw_stream_connect(
+		pr.pw.stream, SPA_DIRECTION_INPUT, PW_ID_ANY,
+		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
+		connect_params, 1
+	);
+
+	if(status < 0) {
+		log_error("Failed to connect PipeWire stream");
+		return 1;
+	}
+
+	pr.exit_code = 0;
+	spa_ringbuffer_init(&pr.input.ring);
+	analyzer_init(&pr.analyzer);
+
+	pw_loop_add_signal(loop, SIGINT, on_signal, &pr);
+	pw_loop_add_signal(loop, SIGTERM, on_signal, &pr);
+	pw_main_loop_run(pr.pw.main_loop);
+
+	log_info("Interrupted; sending cleanup packet and exiting");
+	wled_sync_clear(&pr.wled_sync);
+	wled_sync_send(&pr.wled_sync, &pr.config);
+
+	pw_stream_destroy(pr.pw.stream);
+	pw_main_loop_destroy(pr.pw.main_loop);
+	pw_deinit();
+
+	return pr.exit_code;
 }

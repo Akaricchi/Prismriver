@@ -8,7 +8,7 @@ project('prismriver', 'c',
 cc = meson.get_compiler('c')
 
 add_project_dependencies(
-  dependency('libpulse-simple'),
+  dependency('libpipewire-0.3'),
   dependency('fftw3f'),
   cc.find_library('m', required : false),
   language : 'c')
