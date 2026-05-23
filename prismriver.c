@@ -83,6 +83,7 @@ typedef struct WLEDSync {
 		float smoothed_vol;
 		float loudness_peak;
 		float agc_gain;
+		float agc_denom;
 		float rms_slow;
 		float rms_fast;
 		float rms_ratio;
@@ -176,17 +177,10 @@ static void wled_sync_feed(
 	packet->frameCounter++;
 
 	float sum_sq = 0;
-	float peak_volume = 0;
 
 	for(size_t i = 0; i < QUANT_SIZE; ++i) {
 		float s = samples[i];
 		sum_sq += s * s;
-
-		float m = fabsf(s);
-
-		if(m > peak_volume) {
-			peak_volume = m;
-		}
 	}
 
 	float rms = sqrtf(sum_sq / QUANT_SIZE);
@@ -197,15 +191,16 @@ static void wled_sync_feed(
 	packet->samplePeak = sync->state.rms_ratio > config->rms_peak_threshold;
 
 	const float target_rms = 0.5f;
-	const float agc_response = 0.05f;
+	const float agc_response = ms_to_lerp_factor(3000.0f);
 
-	if(rms > 0.0001f) {
-		float gain = target_rms / rms;
-		sync->state.agc_gain = lerp(sync->state.agc_gain, gain, agc_response);
+	sync->state.agc_denom = lerp(sync->state.agc_denom, rms, agc_response);
+
+	if(sync->state.agc_denom > 0.0f) {
+		sync->state.agc_gain = target_rms / sync->state.agc_denom;
 	}
 
 	float adj_volume = rms * sync->state.agc_gain;
-	sync->state.smoothed_vol = lerp(sync->state.smoothed_vol, adj_volume, 0.05f);
+	sync->state.smoothed_vol = lerp(sync->state.smoothed_vol, adj_volume, ms_to_lerp_factor(60.0f));
 
 	packet->sampleRaw = 255.0f * adj_volume;
 	packet->sampleSmth = 255.0f * sync->state.smoothed_vol;
